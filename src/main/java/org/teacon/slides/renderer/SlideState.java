@@ -22,7 +22,7 @@ import java.lang.reflect.Field;
 import java.net.URI;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.CompletionException;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * @author BloCamLimb
@@ -113,22 +113,42 @@ public final class SlideState {
         return false;
     }
 
-    private void loadImageCache(URI uri) {
-        if (mState != State.LOADED) {
-            SlideImageStore.getImage(uri, true).thenAccept(this::loadImage).exceptionally(e -> {
-                RenderSystem.recordRenderCall(() -> {
-                    mSlide = Slide.failed();
-                    mState = State.FAILED_OR_EMPTY;
-                    mCounter = RETRY_INTERVAL_TICKS;
-                });
-                return null;
+    private void loadImageRemote(URI uri, boolean releaseOld) {
+        SlideImageStore.getImage(uri, true).thenCompose(this::loadImage).thenAccept(texture -> {
+            if (mState != State.LOADED) {
+                if (releaseOld) {
+                    mSlide.release();
+                }
+                mSlide = Slide.make(texture);
+                mState = State.LOADED;
+            }
+        }).exceptionally(e -> {
+            RenderSystem.recordRenderCall(() -> {
+                if (releaseOld) {
+                    mSlide.release();
+                }
+                mSlide = Slide.failed();
+                mState = State.FAILED_OR_EMPTY;
+                mCounter = RETRY_INTERVAL_TICKS;
             });
-        }
+            return null;
+        });
     }
 
     private void loadImage(URI uri) {
-        SlideImageStore.getImage(uri, false).thenAccept(this::loadImage).exceptionally(e -> {
-            RenderSystem.recordRenderCall(() -> loadImageCache(uri));
+        SlideImageStore.getImage(uri, true).thenCompose(this::loadImage).thenAccept(texture -> {
+            RenderSystem.recordRenderCall(() -> {
+                if (mState != State.LOADED) {
+                    mSlide = Slide.make(texture);
+                    loadImageRemote(uri, true);
+                }
+            });
+        }).exceptionally(e -> {
+            RenderSystem.recordRenderCall(() -> {
+                if (mState != State.LOADED) {
+                    loadImageRemote(uri, false);
+                }
+            });
             return null;
         });
         mSlide = Slide.loading();
@@ -136,25 +156,22 @@ public final class SlideState {
         mCounter = RECYCLE_TICKS;
     }
 
-    private void loadImage(byte[] data) {
+    private CompletableFuture<Integer> loadImage(byte[] data) {
+        CompletableFuture<Integer> future = new CompletableFuture<>();
         RenderSystem.recordRenderCall(() -> {
-            if (mState != State.LOADED) {
-                try {
-                    // specifying null will use image source channels
-                    // vanilla minecraft did this on render thread, so it should be ok
-                    NativeImage image = NativeImage.read(null, new ByteArrayInputStream(data));
-                    loadTexture(image);
-                } catch (Exception e) {
-                    throw new CompletionException(e);
-                }
+            try {
+                // specifying null will use image source channels
+                ByteArrayInputStream inputStream = new ByteArrayInputStream(data);
+                NativeImage image = NativeImage.read(null, inputStream);
+                future.complete(loadTexture(image));
+            } catch (Exception e) {
+                future.completeExceptionally(e);
             }
         });
+        return future;
     }
 
-    private void loadTexture(@Nonnull NativeImage image) {
-        if (mState == State.LOADED) {
-            return;
-        }
+    private int loadTexture(@Nonnull NativeImage image) {
         int texture = TextureUtil.generateTextureId();
         // specify maximum mipmap level to 2
         TextureUtil.prepareImage(image.getFormat() == NativeImage.PixelFormat.RGB ?
@@ -188,8 +205,7 @@ public final class SlideState {
         // auto generate mipmap
         GL30.glGenerateMipmap(GL11.GL_TEXTURE_2D);
 
-        mSlide = Slide.make(texture);
-        mState = State.LOADED;
+        return texture;
     }
 
     @Nullable
